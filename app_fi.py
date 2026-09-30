@@ -1,22 +1,10 @@
-"""Finnish Investment Research Bot - watchlist monitor dashboard.
+"""Finnish Investment Research Bot — Nasdaq Helsinki watchlist monitor.
 
-Free data: Yahoo Finance (yfinance) with Helsinki (.HE) suffix -> quote (EUR)
-           + news headlines per ticker. No API key required.
+Free data: Yahoo Finance (yfinance, Helsinki .HE symbols) -> quote (EUR) +
+news headlines. Optional: STT Info Pörssitiedotteet API (free key from
+parse.bot) -> Finnish stock-exchange announcements (the "filings" equivalent).
 
-Finnish companies file with Nasdaq Helsinki / FIN-FSA rather than SEC EDGAR,
-and there is no free public bulk API equivalent to EDGAR, so this version is
-news-only per ticker (matching the spec). A "Pörssitiedotteet" source (STT Info
-via parse.bot) can be added later if you want exchange-announcement listings.
-
-Deployment (Streamlit Community Cloud, free):
-    1. Push this repo to GitHub (public or private).
-    2. Go to https://share.streamlit.io -> "Create app".
-    3. Pick your repo / branch / entrypoint (app_fi.py) -> Deploy.
-    4. Your app lives at https://<subdomain>.streamlit.app .
-
-Local dev:
-    pip install -r requirements.txt
-    streamlit run app_fi.py
+Deployment: Streamlit Community Cloud (free). See DEPLOY.md.
 """
 import streamlit as st
 from datetime import datetime, timezone
@@ -26,62 +14,77 @@ from fetch_fi import (
     save_watchlist,
     quote_for,
     news_for,
-    company_display_name,
-    MARKET_NOTE,
+    stt_search,
+    _fmt_mcap,
+    get_stt_key,
     DEFAULT_WATCHLIST,
+    MARKET_NOTE,
 )
 
+
+# ---------------------------------------------------------------------------
+# Page setup
+# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Finnish Investment Research Bot",
-    page_icon="📈",
+    page_icon="🇫🇮",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-st.title("📈 Finnish Investment Research Bot — Nasdaq Helsinki Watchlist")
+st.title("🇫🇮 Finnish Investment Research Bot — Nasdaq Helsinki Watchlist")
 st.caption(
-    "Free data: **Yahoo Finance** (via yfinance) with Helsinki (.HE) symbols -> "
-    "**quote in EUR** + **news headlines** per ticker. No API key required. "
-    "Data refreshes on demand — hit **Refresh** in the sidebar."
+    "Free data: **Yahoo Finance** (yfinance, Helsinki .HE symbols) -> quote "
+    "in **EUR** + news headlines. **Optional:** STT Info Pörssitiedotteet API "
+    "(free key from parse.bot) for Finnish stock-exchange announcements — the "
+    "closest thing Finland has to SEC filings. Data refreshes on demand — hit "
+    "**Refresh** in the sidebar."
 )
 st.caption(MARKET_NOTE)
 
 
-# ---------------------------------------------------------------- sidebar
+# ---------------------------------------------------------------------------
+# Sidebar — watchlist management
+# ---------------------------------------------------------------------------
 st.sidebar.header("Watchlist")
 
-# initialise session state from disk
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = load_watchlist()
 
 wl = st.session_state.watchlist  # dict: display_name -> yf_symbol
 
 
-# -- add ticker
+# --- add ticker ---
 st.sidebar.subheader("Add ticker")
 add_symbol = st.sidebar.text_input(
-    "Yahoo symbol (with .HE)",
+    "Yahoo symbol (Helsinki, with .HE)",
     placeholder="e.g. FORTUM.HE",
-    help="Helsinki ticker in Yahoo Finance format, e.g. NOKIA.HE, KONE is KNEBV.HE, Nordea is NDA-FI.HE",
+    help=(
+        "Helsinki ticker in Yahoo Finance format, ending in .HE. Examples: "
+        "NOKIA.HE, KONE trades as KNEBV.HE, Nordea as NDA-FI.HE, "
+        "Kesko as KESKOB.HE, Outokumpu as OUT1V.HE, Orion as ORNBV.HE, "
+        "Wärtsilä as WRT1V.HE."
+    ),
 ).strip().upper()
 
 if st.sidebar.button("Add"):
     if not add_symbol:
         st.sidebar.warning("Enter a Yahoo symbol (e.g. FORTUM.HE).")
     elif add_symbol in wl.values():
-        # already in watchlist — find its display name for the message
-        existing_name = next((k for k, v in wl.items() if v == add_symbol), None)
         st.sidebar.warning(f"{add_symbol} is already in the watchlist.")
     else:
-        name = company_display_name(add_symbol)
+        # best-effort company name lookup
+        try:
+            import yfinance as yf
+            info = yf.Ticker(add_symbol).info or {}
+            name = info.get("longName") or info.get("shortName") or ""
+        except Exception:
+            name = ""
         if not name or name == add_symbol:
-            # try a best-effort lookup; if Yahoo doesn't recognise it, warn
             st.sidebar.error(
                 f"❌ '{add_symbol}' not recognised by Yahoo Finance. "
-                "Check the symbol (Helsinki uses .HE suffix; some trade under "
-                "exchange-specific codes, e.g. KONE→KNEBV.HE, Nordea→NDA-FI.HE)."
+                "Check the symbol (must end in .HE for Helsinki)."
             )
         else:
-            # use a friendly display key derived from the Yahoo name
             display = name.split()[0] if name else add_symbol.replace(".HE", "")
             wl[display] = add_symbol
             save_watchlist(wl)
@@ -90,7 +93,7 @@ if st.sidebar.button("Add"):
 
 st.sidebar.divider()
 
-# -- remove
+# --- remove ---
 remove_names = st.sidebar.multiselect(
     "Remove tickers",
     options=sorted(wl.keys()),
@@ -109,7 +112,7 @@ if st.sidebar.button("Remove selected"):
 
 st.sidebar.divider()
 
-# -- reset
+# --- reset ---
 if st.sidebar.button("Reset to defaults (11 yhtyneet)"):
     st.session_state.watchlist = dict(DEFAULT_WATCHLIST)
     save_watchlist(DEFAULT_WATCHLIST)
@@ -118,13 +121,35 @@ if st.sidebar.button("Reset to defaults (11 yhtyneet)"):
 st.sidebar.divider()
 st.sidebar.caption(
     f"{len(wl)} ticker{'s' if len(wl) != 1 else ''} in watchlist · "
-    "Source: Yahoo Finance (yfinance) · Helsinki (.HE) symbols · EUR"
+    "Source: Yahoo Finance (yfinance) · Helsinki (.HE) · EUR · "
+    "Filings: STT Info Pörssitiedotteet (optional)"
 )
 
-# -- refresh
+# --- STT Info API key (optional) ---
+st.sidebar.subheader("STT Info Pörssitiedotteet key (optional)")
+stt_key_input = st.sidebar.text_input(
+    "API key",
+    type="password",
+    placeholder="pmx_... (free key from parse.bot)",
+    help=(
+        "Get a free key at https://parse.bot → marketplace → STT Info "
+        "Pörssitiedotteet API. Free tier: 200 credits/month. Without a key, "
+        "only Yahoo Finance news is shown (no Finnish filings)."
+    ),
+)
+if stt_key_input:
+    st.session_state.stt_key = stt_key_input
+else:
+    st.session_state.stt_key = get_stt_key()
+
+st.sidebar.divider()
+
+# --- refresh ---
 refresh = st.sidebar.button("🔄 Refresh all data")
 
-# ---------------------------------------------------------------- main
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 if not wl:
     st.info("Add Helsinki tickers from the sidebar to populate the watchlist.")
     st.stop()
@@ -152,23 +177,9 @@ st.sidebar.caption(f"Last refresh: {st.session_state.get('fetch_time', '—')}")
 st.divider()
 
 
-# ---------------------------------------------------------------- cards
-def _fmt_mcap(v):
-    if v is None:
-        return "—"
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        return str(v)
-    if v >= 1e12:
-        return f"€{v/1e12:.2f}Bn"  # Finland: billions
-    if v >= 1e9:
-        return f"€{v/1e9:.0f}Bn"
-    if v >= 1e6:
-        return f"€{v/1e6:.0f}Mn"
-    return f"€{v:,.0f}"
-
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def _news_list(news):
     if not news:
         return "_No recent news._"
@@ -188,11 +199,14 @@ def _news_list(news):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Ticker cards
+# ---------------------------------------------------------------------------
 for display_name in sorted(data.keys()):
-    d = data[display_name]
-    q = d["quote"]
-    news = d["news"]
-    yf_symbol = d["yf_symbol"]
+    d = data.get(display_name, {})
+    q = d.get("quote", {})
+    news = d.get("news", [])
+    yf_symbol = d.get("yf_symbol", "")
 
     price = q.get("price")
     prev = q.get("previous_close")
@@ -207,7 +221,7 @@ for display_name in sorted(data.keys()):
             st.warning(
                 f"'{yf_symbol}' returned no quote or news from Yahoo Finance. "
                 "The symbol may be wrong — remove it and try the correct Helsinki "
-                "code (see the Add-ticker help text)."
+                "code (must end in .HE)."
             )
             continue
 
@@ -228,7 +242,7 @@ for display_name in sorted(data.keys()):
 
         st.divider()
 
-        # news
+        # --- news ---
         st.subheader("📰 Recent News")
         st.markdown(_news_list(news))
         st.caption(
@@ -237,10 +251,46 @@ for display_name in sorted(data.keys()):
             "original source."
         )
 
+        # --- filings (STT Info Pörssitiedotteet, optional) ---
+        key = st.session_state.get("stt_key", "") or get_stt_key()
+        if key:
+            with st.spinner("Fetching Finnish stock-exchange announcements (STT Info) …"):
+                filings = stt_search(display_name, key, limit=8)
+            st.divider()
+            st.subheader("📄 Recent Finnish Announcements (Pörssitiedotteet)")
+            if filings and filings[0].get("error"):
+                st.warning(filings[0]["error"])
+            elif filings:
+                for f in filings:
+                    fdate = f.get("date", "")
+                    fcat = f.get("category", "")
+                    ftitle = f.get("title", "(no title)")
+                    fpub = f.get("publisher", "")
+                    furl = f.get("url", "")
+                    cat_str = f"[{fcat}] " if fcat else ""
+                    if furl:
+                        st.link_button(f"{cat_str}{ftitle}", furl, help=f"{fpub} · {fdate}")
+                    else:
+                        st.markdown(f"**{cat_str}{ftitle}** — _{fpub}_ · {fdate}")
+                st.caption(
+                    "Finnish stock-exchange announcements via STT Info "
+                    "(https://parse.bot). These are the closest thing Finland has to "
+                    "SEC filings — material events disclosed to the market."
+                )
+            else:
+                st.info("No recent Finnish announcements found for this company.")
+        elif st.session_state.get("stt_key"):
+            # key was set but is now empty
+            st.divider()
+            st.subheader("📄 Recent Finnish Announcements (Pörssitiedotteet)")
+            st.info("STT Info key cleared. Re-enter it in the sidebar to see Finnish filings.")
+
 st.divider()
 st.caption(
     "Data sources & limitations: Quotes and news come from Yahoo Finance "
     "(via the yfinance library) using Helsinki (.HE) symbols. Free-user quotes "
     "are delayed (~15 min) and update during the Nasdaq Helsinki session. "
-    "This is not financial advice."
+    "Finnish stock-exchange announcements (Pörssitiedotteet) come from STT Info "
+    "via https://parse.bot — a free API key is required (see sidebar). This is "
+    "not financial advice."
 )
